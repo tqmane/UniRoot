@@ -12,7 +12,8 @@ import java.util.zip.ZipException
 /**
  * THE SCRIPT, in the app (NotStable): downloads the LATEST official ksud
  * (KernelSU Next OR classic, per the selected flavor) and patches it with
- * the 8 Samsung KDP+DEFEX kos bundled in the APK — the exact port of
+ * the bundled KMI-specific kos (Samsung KDP+DEFEX, except a supported
+ * non-Samsung target's KMI which uses this release's upstream ko) — the exact port of
  * patch-ksud-next.py.
  *
  * How it works (README-PATCH): ksud embeds its assets via rust-embed +
@@ -36,6 +37,64 @@ object DfKsudUpdater {
     private val KMIS = listOf(
         "android12-5.10", "android13-5.10", "android13-5.15", "android14-5.15",
         "android14-6.1", "android15-6.6", "android16-6.12", "android17-6.18")
+    /** The device-specific KMI slot that must use this release's matching upstream ko. */
+    private fun upstreamKoKmi(): String? {
+        val model = runCatching { android.os.Build.MODEL ?: "" }.getOrDefault("")
+        return when {
+            model == "A059" -> "android14-6.1"
+            model == "OPD2415" -> "android15-6.6"
+            else -> null
+        }
+    }
+
+    /** Stable device/KMI/flavor identity for a cached non-Samsung target ksud. */
+    fun currentTargetKey(classic: Boolean): String? {
+        val kmi = upstreamKoKmi() ?: return null
+        val model = runCatching { android.os.Build.MODEL ?: "" }.getOrDefault("")
+        return "$model|$kmi|${if (classic) "classic" else "next"}"
+    }
+
+    @JvmStatic
+    fun currentTargetClassicKsud(context: Context): File? {
+        val key = currentTargetKey(classic = true) ?: return null
+        val ksud = KsudClassicProfiles.latestFile(context)
+        val stamp = File(context.filesDir, "ksud-classic-latest.target")
+        val targetKsud = ksud.takeIf {
+            it.isFile && runCatching { stamp.readText() == key }.getOrDefault(false)
+        } ?: return null
+        KsudClassicProfiles.list(context).firstOrNull { it.dynamic }?.let {
+            KsudClassicProfiles.setSelected(context, it.id)
+        }
+        return targetKsud
+    }
+
+    @JvmStatic
+    fun currentTargetNextKsud(context: Context): File? {
+        val key = currentTargetKey(classic = false) ?: return null
+        val profile = KsudNextProfiles.list(context).firstOrNull { candidate ->
+            if (!candidate.dynamic) return@firstOrNull false
+            val stamp = File(KsudNextProfiles.dynamicDir(context), "${candidate.id}.target")
+            runCatching { stamp.readText() == key }.getOrDefault(false)
+        } ?: return null
+        KsudNextProfiles.setSelected(context, profile.id)
+        return File(KsudNextProfiles.dynamicDir(context), profile.id)
+    }
+
+    /** Makes DirtyFrag's selected flavor target-compatible before staging it. */
+    fun ensureTargetKsud(context: Context, next: Boolean, onLog: (String) -> Unit): Boolean {
+        val targetKey = currentTargetKey(classic = !next) ?: return true
+        val cached = if (next) currentTargetNextKsud(context) else currentTargetClassicKsud(context)
+        if (cached != null) return true
+
+        onLog("[*] Preparing target-matched ${if (next) "KernelSU Next" else "KernelSU classic"} ksud for $targetKey…")
+        val result = runCatching {
+            run(context, classic = !next, onLog = onLog)
+        }.getOrElse { "ERROR: ${it.message ?: it.javaClass.simpleName}" }
+        val prepared = if (next) currentTargetNextKsud(context) else currentTargetClassicKsud(context)
+        if (prepared != null) return true
+        onLog("[-] Target ksud preparation failed: $result")
+        return false
+    }
 
     /** journal -> UI + logcat */
     var log: ((String) -> Unit)? = null
@@ -276,10 +335,23 @@ object DfKsudUpdater {
         // (KernelSU_Next_v3.4.0_33294-release.apk) -> id = "3.4.0-33294".
         val code = Regex("""KernelSU(?:_Next)?_v[\d.]+_(\d+)-release\.apk""").find(releaseJson)
             ?.groupValues?.get(1)
-        val niceName = if (code != null) "$version-$code" else "$version-samsung"
+        val targetSuffix = when (runCatching { android.os.Build.MODEL ?: "" }.getOrDefault("")) {
+            "A059" -> "a059"
+            "OPD2415" -> "opd2415"
+            else -> null
+        }
+        val baseName = when {
+            code != null -> "$version-$code"
+            targetSuffix == null -> "$version-samsung"
+            else -> version
+        }
+        val niceName = if (targetSuffix == null) baseName else "$baseName-$targetSuffix"
 
         val ksud = downloadKsud(tag, repo, progress)
-        val patched = patchKsud(context, ksud, tag, classic, progress)
+        val patched = patchKsud(context, ksud, tag, repo, classic, progress)
+        val patchNote = upstreamKoKmi()?.let { targetKmi ->
+            "official ksud $tag; upstream $targetKmi ko + Samsung KDP+DEFEX kos for other slots"
+        } ?: "official ksud $tag + Samsung KDP+DEFEX kos - patched on device"
 
         return if (classic) {
             // CLASSIC: the engine stages the SELECTED classic profile
@@ -287,21 +359,31 @@ object DfKsudUpdater {
             // drives "you are already updated". Profile name = version-code.
             File(context.filesDir, "ksud-classic-latest").writeBytes(patched)
             File(context.filesDir, "ksud-classic-latest.tag").writeText(tag)
-            KsudClassicProfiles.selectLatest(context, niceName,
-                "official ksud $tag + Samsung KDP+DEFEX kos - patched on device")
+            currentTargetKey(classic = true)?.let {
+                File(context.filesDir, "ksud-classic-latest.target").writeText(it)
+            }
+            KsudClassicProfiles.selectLatest(context, niceName, patchNote)
             say("[+] Classic profile '$niceName' saved and SELECTED (ksud-classic-latest)")
             progress(100, "Done: $tag patched -> classic profile '$niceName'")
             "OK: $tag patched -> classic profile '$niceName'"
         } else {
             val profileId = niceName
             if (alreadyUpdatedNext(context, profileId)) {
+                KsudNextProfiles.setSelected(context, profileId)
+                currentTargetKey(classic = false)?.let { targetKey ->
+                    val profileFile = File(KsudNextProfiles.dynamicDir(context), profileId)
+                    File(profileFile.parentFile, "${profileFile.name}.target").writeText(targetKey)
+                }
                 progress(100, "you are already updated")
                 say("you are already updated")
                 say("    ($tag is already patched: profile '$profileId')")
                 return "you are already updated ($tag)"
             }
-            KsudNextProfiles.addDynamic(context, profileId, patched,
-                "official ksud $tag + Samsung KDP+DEFEX kos - patched on device")
+            KsudNextProfiles.addDynamic(context, profileId, patched, patchNote)
+            currentTargetKey(classic = false)?.let { targetKey ->
+                val profileFile = KsudNextProfiles.selectedFile(context)
+                profileFile?.let { File(it.parentFile, "${it.name}.target").writeText(targetKey) }
+            }
             say("[+] Profile '$profileId' created and SELECTED")
             progress(100, "Done")
             "OK: $tag patched -> profile '$profileId'"
@@ -316,10 +398,9 @@ object DfKsudUpdater {
     // ------------------------------------------------------------------
 
     private fun patchKsud(
-        context: Context, ksud: ByteArray, tag: String, classic: Boolean,
+        context: Context, ksud: ByteArray, tag: String, repo: String, classic: Boolean,
         progress: (Int, String) -> Unit,
     ): ByteArray {
-        val repo = if (classic) REPOS_CLASSIC[0] else REPOS_NEXT[0]
         val refBase = "https://github.com/$repo/releases/download/$tag"
 
         // References: the official kos OF THIS RELEASE (hash resolution of
@@ -328,6 +409,7 @@ object DfKsudUpdater {
         progress(40, "Downloading reference kos…")
         say("[*] Downloading official kos of $tag (reference)…")
         val refHashes = HashMap<String, String>()
+        val referenceKos = HashMap<String, ByteArray>()
         for (kmi in KMIS) {
             val bytes = if (classic) {
                 runCatching { httpGet("$refBase/lkm-aarch64-${kmi}_kernelsu.ko") }
@@ -339,18 +421,29 @@ object DfKsudUpdater {
                     .recoverCatching { httpGet("$refBase/${kmi}_kernelsu.ko") }
                     .getOrNull()
             }
-            if (bytes != null) refHashes[sha256Hex(bytes)] = kmi
+            if (bytes != null) {
+                refHashes[sha256Hex(bytes)] = kmi
+                referenceKos[kmi] = bytes
+            }
         }
         say("    ${refHashes.size}/8 references loaded")
 
-        // The Samsung KDP+DEFEX kos bundled in the APK - matched by the KMI
-        // IN THE FILE NAME (android16-6.12_kernelsu-XXX.ko accepted), like
-        // patch-ksud-next.py does.
+        // Samsung KDP+DEFEX kos are used for Samsung slots. Nothing/OnePlus
+        // instead use the upstream ko from this exact release for their own
+        // KMI slot, preserving the correct KernelSU flavor and avoiding
+        // Samsung-only symbols on non-Samsung kernels.
         val koDir = if (classic) KO_ASSET_DIR_CLASSIC else KO_ASSET_DIR
         val koAssets = runCatching { context.assets.list(koDir)?.toList() ?: emptyList() }
             .getOrDefault(emptyList())
+        val upstreamKmi = upstreamKoKmi()
         val replacements = HashMap<String, ByteArray>()
         for (kmi in KMIS) {
+            if (kmi == upstreamKmi) {
+                replacements[kmi] = referenceKos[kmi]
+                    ?: throw IllegalStateException("Upstream $kmi ko unavailable in $repo release $tag")
+                say("    $kmi: upstream ${if (classic) "KernelSU" else "KernelSU Next"} ko for this device")
+                continue
+            }
             val name = koAssets.firstOrNull { it.startsWith("${kmi}_kernelsu") && it.endsWith(".ko") }
                 ?: throw IllegalStateException("Samsung ko missing from the APK: $kmi")
             replacements[kmi] = context.assets.open("$koDir/$name").use { it.readBytes() }
@@ -387,7 +480,7 @@ object DfKsudUpdater {
         }
         check(plan.isNotEmpty()) { "no patchable slot in this ksud" }
 
-        progress(75, "Injecting Samsung kos…")
+        progress(75, "Injecting kernel modules…")
         for (p in plan) {
             val pad = p.slot.consumed - p.comp.size
             p.comp.copyInto(data, p.slot.start)

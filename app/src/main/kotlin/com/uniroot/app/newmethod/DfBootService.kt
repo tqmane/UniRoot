@@ -102,6 +102,10 @@ class DfBootService : Service() {
                 }, { _, _ -> })
                 bootLog("=== attempt $attempt rc=$rc ===")
                 if (rc == 0) return
+                if (rc == DfEngine.KSUD_PREPARATION_FAILED) {
+                    bootLog("target ksud preparation failed; not retrying this boot")
+                    return
+                }
                 if (attempt < 6) {
                     Thread.sleep(30_000)
                     if (java.io.File("/dev/df").exists()) {

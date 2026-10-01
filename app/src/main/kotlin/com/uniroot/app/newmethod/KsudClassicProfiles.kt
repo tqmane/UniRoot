@@ -37,6 +37,7 @@ object KsudClassicProfiles {
 
     /** "3.3.0-32601" — written by the updater, used as the profile label. */
     private fun nameFile(context: Context): File = File(context.filesDir, "ksud-classic-latest.name")
+    private fun noteFile(context: Context): File = File(context.filesDir, "ksud-classic-latest.note")
 
     private fun latestName(context: Context): String? =
         nameFile(context).takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() }
@@ -55,7 +56,9 @@ object KsudClassicProfiles {
             out.add(ClassicProfile(
                 id = name,
                 label = name,
-                note = "official ksud $tag + Samsung KDP+DEFEX kos - patched on device",
+                note = noteFile(context).takeIf { it.isFile }?.readText()?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: "official ksud $tag patched on device",
                 dynamic = true))
         }
         out.add(ClassicProfile(
@@ -90,6 +93,7 @@ object KsudClassicProfiles {
     /** Enregistre le résultat de l'updater et le SÉLECTIONNE. */
     fun selectLatest(context: Context, name: String, note: String) {
         nameFile(context).writeText(name)
+        noteFile(context).writeText(note)
         setSelected(context, name)
     }
 
@@ -100,6 +104,8 @@ object KsudClassicProfiles {
         f.delete()
         markerFile(context).delete()
         nameFile(context).delete()
+        noteFile(context).delete()
+        File(context.filesDir, "ksud-classic-latest.target").delete()
         setSelected(context, "bundled-universal")
         return existed
     }

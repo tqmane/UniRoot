@@ -1925,7 +1925,9 @@ private fun ProfileEditDialog(
                         text = stringResource(R.string.save),
                         colors = ButtonDefaults.textButtonColorsPrimary(),
                         onClick = {
-                            if (name.isBlank() || soPath.isBlank() || koPath.isBlank() || ksudPath.isBlank()) {
+                            val isStandalone = profile?.standalone ?: false
+                            if (name.isBlank() || soPath.isBlank() || ksudPath.isBlank() ||
+                                (koPath.isBlank() && !isStandalone)) {
                                 Toast.makeText(context, R.string.profile_missing_fields, Toast.LENGTH_SHORT).show()
                                 return@TextButton
                             }
@@ -1935,11 +1937,12 @@ private fun ProfileEditDialog(
                                 pathSo = soPath,
                                 pathKo = koPath,
                                 pathKsud = ksudPath,
-                                deviceType = deviceType,
+                                deviceType = if (isStandalone) profile?.deviceType ?: deviceType else deviceType,
                                 pathCveNormal = cveNormalPath.ifBlank { null },
                                 pathCveRoot = cveRootPath.ifBlank { null },
                                 flavor = profile?.flavor ?: "kernelsu",
                                 useShizuku = useShizuku,
+                                standalone = isStandalone,
                             )
                             onSave(updated, profile?.name)
                         },

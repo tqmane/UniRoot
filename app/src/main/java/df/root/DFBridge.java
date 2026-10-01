@@ -100,6 +100,17 @@ public final class DFBridge {
     public static void stageKsud(Context context, boolean next, IReporter reporter,
                                  String ksudNextAsset) throws IOException {
         File root = context.getFilesDir().getParentFile();
+        // On the integrated Nothing/OnePlus targets, the matching upstream
+        // KMI build takes precedence over custom or generic Samsung profiles.
+        File targetKsud = next
+                ? com.uniroot.app.newmethod.DfKsudUpdater.currentTargetNextKsud(context)
+                : com.uniroot.app.newmethod.DfKsudUpdater.currentTargetClassicKsud(context);
+        if (targetKsud != null && targetKsud.isFile()) {
+            copyFile(targetKsud, new File(root, "ksud"));
+            reporter.report("staged target-matched UniRoot ksud (" + targetKsud.getName()
+                    + ", " + targetKsud.length() + " bytes)\n");
+            return;
+        }
         // User-patched ksud (Advanced -> Patch custom ko): wins over bundled.
         File custom = new File(root, next ? "ksud-custom-next" : "ksud-custom-classic");
         if (custom.isFile() && custom.length() > 100_000) {

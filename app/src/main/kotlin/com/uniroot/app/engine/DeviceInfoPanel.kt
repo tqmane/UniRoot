@@ -29,6 +29,8 @@ object DeviceInfoPanel {
     fun marketingName(): String {
         val model = Build.MODEL ?: ""
         SAMSUNG_NAMES.forEach { (k, v) -> if (model.startsWith(k)) return "$v ($model)" }
+        if (model == "A059") return "Nothing Phone (3a) ($model)"
+        if (model == "OPD2415") return "OnePlus Pad 3 ($model)"
         return model.ifBlank { Build.DEVICE ?: "?" }
     }
 

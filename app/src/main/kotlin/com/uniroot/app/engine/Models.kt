@@ -7,6 +7,8 @@ data class DeviceProfile(
     val flavor: String = "kernelsu",
     /** Run this profile's payload through the Shizuku shell (UID 2000), like S26 Ultra / Z Fold 8. */
     val useShizuku: Boolean = false,
+    /** Standalone PIE payload (Root-My-Device style): executed directly, not via LD_PRELOAD. */
+    val standalone: Boolean = false,
 )
 
 data class DeviceInfo(

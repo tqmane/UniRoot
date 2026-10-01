@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object DfEngine {
 
+    const val KSUD_PREPARATION_FAILED = -2
+
     @Volatile private var stage: String = "Chargement moteur DF…"
     @Volatile private var milestone: Int = 12
 
@@ -35,6 +37,12 @@ object DfEngine {
         stage = "Loading DF engine…"
         milestone = 12
         onProgress(milestone, stage)
+
+        if (!DfKsudUpdater.ensureTargetKsud(context, next = ksuNext, onLog = onLog)) {
+            stage = "Target KernelSU module unavailable"
+            onProgress(100, stage)
+            return KSUD_PREPARATION_FAILED
+        }
 
         df.root.DFBridge.load(ksuNext)
         val flavor = if (ksuNext) "KernelSU Next" else "KernelSU"

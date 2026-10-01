@@ -534,7 +534,11 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
             delay(if (stopped) 800L else 200L)
             // Shizuku `am start` always works (even with the app in background);
             // the launch-intent path is the fallback.
-            val activity = if (pkg.startsWith("com.rifsxd")) "com.rifsxd.ksunext.ui.MainActivity" else "me.weishu.kernelsu.ui.MainActivity"
+            val activity = if (pkg.startsWith("com.rifsxd")) {
+                "com.rifsxd.ksunext.ui.MainActivity"
+            } else {
+                "me.weishu.kernelsu.ui.MainActivity"
+            }
             val started = engine.startManagerViaShizuku(pkg, activity)
             if (!started) {
                 val intent = packageManager.getLaunchIntentForPackage(pkg)
@@ -643,7 +647,7 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
         val profile = engine.profileByName(selectedProfileName) ?: return
         // Shizuku profiles: S26 Ultra / Z Fold 8 (by name) or a profile with the
         // per-profile "Use Shizuku" switch on. The user sees exactly what blocks.
-        val wantShizuku = RootEngine.profileNeedsShizuku(profile.name) || profile.useShizuku
+        val wantShizuku = RootEngine.profileNeedsShizuku(profile)
 
         if (wantShizuku) {
             if (!engine.shizukuBinderActive()) {

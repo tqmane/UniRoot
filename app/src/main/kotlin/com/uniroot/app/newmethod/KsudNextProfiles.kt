@@ -45,10 +45,12 @@ object KsudNextProfiles {
         val names: List<String> = runCatching {
             context.assets.list(DIR)?.toList() ?: emptyList()
         }.getOrDefault(emptyList())
-        val embedded = names.filter { it.isNotEmpty() && !it.endsWith(".txt") }
+        val embedded = names.filter { it.isNotEmpty() && !it.endsWith(".txt") && !it.endsWith(".target") }
             .map { name -> profileFromId(context, name, dynamic = false) }
         val dynamic = runCatching {
-            dynamicDir(context).listFiles { f -> f.isFile && !f.name.endsWith(".txt") }
+            dynamicDir(context).listFiles {
+                f -> f.isFile && !f.name.endsWith(".txt") && !f.name.endsWith(".target")
+            }
                 ?.map { it.name }
                 ?.map { name -> profileFromId(context, name, dynamic = true) }
                 ?: emptyList()
@@ -143,6 +145,7 @@ object KsudNextProfiles {
         val f = File(dynamicDir(context), id)
         if (!f.isFile) return false
         sidecar(context, id).delete()
+        File(dynamicDir(context), "$id.target").delete()
         return f.delete()
     }
 

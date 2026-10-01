@@ -158,7 +158,7 @@ class AutoRootService : Service() {
             if (engine.autoRootBootCount() == bootCount) { stopSelf(); return@launch }
             engine.setAutoRootBootCount(bootCount)
 
-                val needsShizuku = RootEngine.profileNeedsShizuku(profile.name) || profile.useShizuku
+            val needsShizuku = RootEngine.profileNeedsShizuku(profile)
             var status = "Crash"
             try {
                 updateLive(8, getString(R.string.autoroot_settling))

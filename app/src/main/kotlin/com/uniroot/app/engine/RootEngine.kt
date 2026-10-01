@@ -44,9 +44,15 @@ class RootEngine(private val context: Context) {
          * S26 Ultra (6.12.69) and Z Fold 8 / F976X (6.12.58). Their h8q-family
          * preloads need a live shell host — the app-forced Local mode is for
          * the S25 6.6 family only.
+         * Nothing Phone (3a) / OnePlus Pad 3 (Root-My-Device ports, standalone
+         * PIE payloads) also require Shizuku.
          */
         fun profileNeedsShizuku(name: String?): Boolean =
-            name != null && (name.startsWith("S26") || name.startsWith("Z Fold 8") || name.startsWith("F976"))
+            name != null && (name.startsWith("S26") || name.startsWith("Z Fold 8") || name.startsWith("F976") ||
+                name.startsWith("Nothing") || name.startsWith("OnePlus"))
+
+        fun profileNeedsShizuku(profile: DeviceProfile): Boolean =
+            profile.standalone || profile.useShizuku || profileNeedsShizuku(profile.name)
     }
 
     // ---------------------------------------------------------------------
@@ -143,6 +149,8 @@ class RootEngine(private val context: Context) {
             "s26u-zzhk-next" to listOf("cve.so", "kernelsu.ko", "ksud"),
             "zfold8" to listOf("cve.so", "kernelsu.ko", "ksud"),
             "zfold8-next" to listOf("cve.so", "kernelsu.ko", "ksud"),
+            "nothing-a059" to listOf("cve-2026-43499-standalone", "cve-2026-43499-root"),
+            "oneplus-pad3" to listOf("cve-2026-43499-standalone", "cve-2026-43499-root"),
         )
         for ((dir, files) in mapping) {
             for (name in files) {
@@ -221,15 +229,19 @@ class RootEngine(private val context: Context) {
         val json = prefs.getString("profiles_json", null) ?: return
         runCatching {
             val arr = JSONArray(json)
+            var schemaChanged = false
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
+                if (o.has("kmi") || o.has("managerPackage")) schemaChanged = true
                 profiles.add(DeviceProfile(
                     o.getString("name"), o.optString("kaslrOffset", ""),
                     o.getString("pathSo"), o.getString("pathKo"), o.getString("pathKsud"),
                     o.optString("deviceType", "samsung"),
                     o.optString("pathCveNormal", null), o.optString("pathCveRoot", null),
-                    o.optString("flavor", "kernelsu"), o.optBoolean("useShizuku", false)))
+                    o.optString("flavor", "kernelsu"), o.optBoolean("useShizuku", false),
+                    o.optBoolean("standalone", false)))
             }
+            if (schemaChanged) saveProfiles()
         }
     }
     fun saveProfiles() {
@@ -239,6 +251,7 @@ class RootEngine(private val context: Context) {
             put("pathKo", p.pathKo); put("pathKsud", p.pathKsud); put("deviceType", p.deviceType)
             put("pathCveNormal", p.pathCveNormal); put("pathCveRoot", p.pathCveRoot)
             put("flavor", p.flavor); put("useShizuku", p.useShizuku)
+            put("standalone", p.standalone)
         })
         prefs.edit().putString("profiles_json", arr.toString()).apply()
     }
@@ -246,12 +259,20 @@ class RootEngine(private val context: Context) {
     private data class DefaultSpec(
         val name: String, val flavor: String, val dir: String,
         val deviceType: String, val classic: Boolean,
+        val standalone: Boolean = false,
+        val shizuku: Boolean = false,
     )
 
     /**
      * Bundled profiles (specs). Profiles are created when MISSING only, so a new
      * APK with extra profiles (e.g. the KernelSU-Next set) augments existing
      * installs without touching user-created profiles or edits.
+     *
+     * Nothing Phone (3a) / OnePlus Pad 3 are Root-My-Device ports: standalone
+     * PIE payload + temporary-root helper; UniRoot's updater supplies the
+     * target-KMI KernelSU daemon.
+     * Only values are ported (no exact-build philosophy); detection is
+     * model+kernel based, UniRoot style.
      */
     private fun defaultSpecs() = listOf(
         DefaultSpec("S93XX (Samsung S25)", "kernelsu", "s93XX", "samsung", false),
@@ -265,14 +286,50 @@ class RootEngine(private val context: Context) {
         DefaultSpec("S26 Ultra 6.12.69 ZZHK Next", "kernelsu_next", "s26u-zzhk-next", "oppo", false),
         DefaultSpec("F976X 6.12.58", "kernelsu", "zfold8", "samsung", false),
         DefaultSpec("F976X 6.12.58 Next", "kernelsu_next", "zfold8-next", "samsung", false),
+        DefaultSpec("Nothing Phone (3a) A059", "kernelsu", "nothing-a059", "nothing", false,
+            standalone = true, shizuku = true),
+        DefaultSpec("OnePlus Pad 3 OPD2415", "kernelsu", "oneplus-pad3", "oneplus", false,
+            standalone = true, shizuku = true),
     )
 
     private fun ensureDefaultProfiles() {
         val extDir = context.getExternalFilesDir(null) ?: return
         var changed = false
         for (spec in defaultSpecs()) {
-            if (profiles.any { it.name == spec.name }) continue
             val dir = File(extDir, spec.dir).apply { mkdirs() }
+            val existingIndex = profiles.indexOfFirst { it.name == spec.name }
+            if (existingIndex >= 0) {
+                if (spec.standalone) {
+                    // Replace the previously imported target ksud with UniRoot's
+                    // own fallback and drop any legacy manager/KMI metadata.
+                    val ksud = copyAssetFromFile("df/ksud-new-classic", File(dir, "ksud")) ?: continue
+                    val existing = profiles[existingIndex]
+                    val migrated = existing.copy(
+                        pathKo = "",
+                        pathKsud = ksud.absolutePath,
+                        deviceType = spec.deviceType,
+                        flavor = "kernelsu",
+                        useShizuku = true,
+                        standalone = true,
+                    )
+                    if (migrated != existing) {
+                        profiles[existingIndex] = migrated
+                        changed = true
+                    }
+                }
+                continue
+            }
+            if (spec.standalone) {
+                val payload = copyAssetFromFile("profiles/${spec.dir}/cve-2026-43499-standalone", File(dir, "cve-2026-43499-standalone")) ?: continue
+                val ksud = copyAssetFromFile("df/ksud-new-classic", File(dir, "ksud")) ?: continue
+                val helper = copyAssetFromFile("profiles/${spec.dir}/cve-2026-43499-root", File(dir, "cve-2026-43499-root")) ?: continue
+                profiles.add(DeviceProfile(
+                    spec.name, "", payload.absolutePath, "", ksud.absolutePath,
+                    spec.deviceType, null, helper.absolutePath, spec.flavor,
+                    useShizuku = true, standalone = true))
+                changed = true
+                continue
+            }
             val so = copyAssetToFile("profiles/${spec.dir}/cve.so", File(dir, "cve.so")) ?: continue
             val ko = copyAssetFromFile("profiles/${spec.dir}/kernelsu.ko", File(dir, "kernelsu.ko")) ?: continue
             val ksud = copyAssetFromFile("profiles/${spec.dir}/ksud", File(dir, "ksud")) ?: continue
@@ -284,7 +341,8 @@ class RootEngine(private val context: Context) {
             }
             profiles.add(DeviceProfile(
                 spec.name, "", so.absolutePath, ko.absolutePath, ksud.absolutePath,
-                spec.deviceType, cn?.absolutePath, cr?.absolutePath, spec.flavor))
+                spec.deviceType, cn?.absolutePath, cr?.absolutePath, spec.flavor,
+                useShizuku = spec.shizuku))
             changed = true
         }
         if (changed) saveProfiles()
@@ -615,11 +673,15 @@ class RootEngine(private val context: Context) {
             model.startsWith("SM-S948") && kernel.contains("6.12.69") -> "S26 Ultra 6.12.69 ZZHK"
             model.startsWith("SM-S931") && kernel.contains("6.6.127") && incremental.contains("ZZI4") -> "S25 6.6.127 ZZI4"
             model.startsWith("SM-S931") && kernel.contains("6.6.127") && incremental.contains("ZZHL") -> "S25 6.6.127 ZZHL"
+            model == "A059" && kernel.contains("6.1.157-android14-11") -> "Nothing Phone (3a) A059"
+            model == "OPD2415" && kernel.contains("6.6.118-android15-8") -> "OnePlus Pad 3 OPD2415"
             else -> null
         }
         val soc = when {
             model.startsWith("SM-S948") -> "Snapdragon 8 Elite Gen 5"
             model.startsWith("SM-S93") -> "Snapdragon 8 Elite"
+            model == "A059" -> "Snapdragon 7s Gen 3"
+            model == "OPD2415" -> "Snapdragon 8 Elite"
             else -> "-"
         }
         return DeviceInfo(model, kernel.ifEmpty { incremental }, soc, matched)
@@ -638,7 +700,13 @@ class RootEngine(private val context: Context) {
         try {
             val p = newShellProcess(cmd, useShizuku)
             val ok = p.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
-            if (!ok) { appendLog("[!] Command timed out: ${cmd.take(80)}"); p.destroyForcibly(); -2 } else 0
+            if (!ok) {
+                appendLog("[!] Command timed out: ${cmd.take(80)}")
+                p.destroyForcibly()
+                -2
+            } else {
+                p.exitValue()
+            }
         } catch (e: Exception) { appendLog("[!] Command failed: ${e.javaClass.simpleName} ${cmd.take(60)}"); -1 }
     }
 
@@ -678,6 +746,25 @@ class RootEngine(private val context: Context) {
         return ShizukuProcessAdapter(remote)
     }
 
+    private suspend fun kernelSuVisibleThroughShizuku(): Boolean {
+        if (ksuModuleLoaded()) return true
+        val modules = executeCommandAndReturnOutput("cat /proc/modules 2>/dev/null", useShizuku = true)
+        return moduleLinePresent(modules)
+    }
+
+    private suspend fun runStandaloneShizuku(profile: DeviceProfile): String =
+        StandaloneRootRunner(
+            context = context,
+            appendLog = ::appendLog,
+            runShizukuCommand = { command -> runDiagnosticCommand(command, useShizuku = true) },
+            captureShizukuOutput = { command ->
+                executeCommandAndReturnOutput(command, useShizuku = true)
+            },
+            startShizukuProcess = { command -> newShellProcess(command, useShizuku = true) },
+            kernelSuVisible = ::kernelSuVisibleThroughShizuku,
+            rootAlive = ::rootAlive,
+        ).run(profile)
+
 
     suspend fun runExecutionPipeline(rawProfile: DeviceProfile, useShizukuParam: Boolean): String {
         appendLog("==========================================")
@@ -701,7 +788,7 @@ class RootEngine(private val context: Context) {
         // tourne via le shell UID 2000. Les profils Samsung S25 sans fichiers
         // avancés restent en mode Local VALIDÉ (helper --run-payload + oracle
         // physique) : le toggle Shizuku est ignoré pour eux.
-        val shizukuProfile = profileNeedsShizuku(profile.name)
+        val shizukuProfile = profileNeedsShizuku(profile)
         var useShizuku = useShizukuParam || profile.useShizuku
         if (shizukuProfile) useShizuku = true
         if (useShizuku && !shizukuProfile && profile.deviceType == "samsung" && profile.pathCveNormal.isNullOrEmpty()) {
@@ -712,7 +799,9 @@ class RootEngine(private val context: Context) {
         // Option "latest from GitHub" : remplacer ksud/.ko embarqués par les
         // dernières versions officielles KernelSU (déconseillé). Sans elle, on
         // utilise les fichiers du profil — testés et prévus pour KernelSU.
-        if (useLatestKsu && profile.pathKsud.isNotEmpty()) {
+        // Standalone Nothing/OnePlus profiles prepare a target-matched UniRoot
+        // ksud through the updater before their payload is launched.
+        if (useLatestKsu && profile.pathKsud.isNotEmpty() && !profile.standalone) {
             var files = latestKsuFilesFor(profile)
             if (files == null) {
                 appendLog("[KernelSU] Downloading latest KernelSU binaries from GitHub...")
@@ -741,6 +830,16 @@ class RootEngine(private val context: Context) {
         
         try {
             if (useShizuku) {
+                // --- Standalone target payload, then UniRoot's own KSU helper/ksud. ---
+                // The imported target helper is only for temporary-root handoff;
+                // UniRoot's helper performs the KernelSU late-load.
+                if (profile.standalone) {
+                    val st = runStandaloneShizuku(profile)
+                    finalStatus = st
+                    if (st == "Success") markRooted(rawProfile.name)
+                    endRunLog(st, rawProfile.name, System.currentTimeMillis() - runStartedAt)
+                    return st
+                }
                 // --- MODE SHIZUKU (Utilisation d'un fichier de log pour ne pas casser l'exploit) ---
                 appendLog("[Shizuku] Sanity check (id)…")
                 val sanity = executeCommandAndReturnOutput("id; echo rc=\$?", true)
