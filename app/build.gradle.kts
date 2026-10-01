@@ -7,9 +7,11 @@ plugins {
 
 val appName = "Uni-Root"
 val appVersionName = "5.0.0"
+val dirtyfragDiagnosticOnly = providers.gradleProperty("dirtyfragDiagnosticOnly")
+    .orNull.equals("true", ignoreCase = true)
 
 android {
-    ndkVersion = "30.0.16248370"
+    if (dirtyfragDiagnosticOnly) ndkVersion = "30.0.16248370"
     namespace = "com.uniroot.app"
     compileSdk {
         version = release(37) {
@@ -22,8 +24,11 @@ android {
         targetSdk = 37
         versionCode = 300
         versionName = appVersionName
-        ndk {
-            abiFilters += listOf("arm64-v8a")
+        buildConfigField("boolean", "DIRTYFRAG_DIAGNOSTIC_ONLY", dirtyfragDiagnosticOnly.toString())
+        if (dirtyfragDiagnosticOnly) {
+            ndk {
+                abiFilters += listOf("arm64-v8a")
+            }
         }
     }
     buildTypes {
@@ -32,6 +37,7 @@ android {
         }
         debug {
             signingConfig = signingConfigs.getByName("debug")
+            if (dirtyfragDiagnosticOnly) applicationIdSuffix = ".diagnostic"
         }
     }
     buildFeatures {
@@ -42,10 +48,12 @@ android {
             useLegacyPackaging = true
         }
     }
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/jni/CMakeLists.txt")
-            version = "3.22.1"
+    if (dirtyfragDiagnosticOnly) {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/jni/CMakeLists.txt")
+                version = "3.22.1"
+            }
         }
     }
 }

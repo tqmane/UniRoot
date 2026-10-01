@@ -470,6 +470,12 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
             // the manager-style essentials only.
             val keep = setOf("Device", "Android", "Kernel")
             deviceInfoRows = rows.filter { it.first in keep }
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY) {
+                rootStateRow = "Diagnostic"
+                rootDetailRow = "Root probes disabled in diagnostic build"
+                selinuxRow = ""
+                return@launch
+            }
             // Grant-independent root state + flavor line
             val (state, _, detail) = com.uniroot.app.engine.DeviceInfoPanel.rootState()
             val flavor = com.uniroot.app.engine.DeviceInfoPanel.flavor(this@MainActivity)
@@ -612,7 +618,13 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                         })
                 }
                 engine.appendLog("[NewMethod] DF rc=$rc")
-                if (rc == 0) {
+                if (rc == com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE) {
+                    newMethodProgress = 100
+                    newMethodStage = "Diagnostic complete — root chain skipped"
+                    Toast.makeText(this@MainActivity,
+                        "Page-cache diagnostic complete; root chain was not run",
+                        Toast.LENGTH_LONG).show()
+                } else if (rc == 0) {
                     newMethodProgress = 100
                     newMethodStage = "Phone rooted ✓"
                     engine.markRooted("DF")
@@ -635,7 +647,9 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                 engine.setRunning(false)
                 sheetDismissible = true
                 runCatching {
-                    engine.endRunLog(if (rc == 0) "Success" else "Failed", "GhostSam",
+                    engine.endRunLog(
+                        if (rc == 0) "Success" else if (rc == com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE) "Diagnostic" else "Failed",
+                        "GhostSam",
                         android.os.SystemClock.elapsedRealtime() - t0)
                 }
                 runLogs = engine.listRunLogs()

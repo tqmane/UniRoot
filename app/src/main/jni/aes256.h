@@ -107,6 +107,48 @@ static inline void _inv_mix_cols(uint8_t s[16]) {
     }
 }
 
+static inline void _sub_bytes(uint8_t s[16]) {
+    for (int i = 0; i < 16; i++) s[i] = _sbox[s[i]];
+}
+
+static inline void _shift_rows(uint8_t s[16]) {
+    uint8_t t;
+    t=s[1]; s[1]=s[5]; s[5]=s[9]; s[9]=s[13]; s[13]=t;
+    t=s[2]; s[2]=s[10]; s[10]=t;
+    t=s[6]; s[6]=s[14]; s[14]=t;
+    t=s[15]; s[15]=s[11]; s[11]=s[7]; s[7]=s[3]; s[3]=t;
+}
+
+static inline void _mix_cols(uint8_t s[16]) {
+    for (int c = 0; c < 4; c++) {
+        uint8_t a=s[4*c], b=s[4*c+1], d=s[4*c+2], e=s[4*c+3];
+        s[4*c]   = _gmul(2,a)^_gmul(3,b)^d^e;
+        s[4*c+1] = a^_gmul(2,b)^_gmul(3,d)^e;
+        s[4*c+2] = a^b^_gmul(2,d)^_gmul(3,e);
+        s[4*c+3] = _gmul(3,a)^b^d^_gmul(2,e);
+    }
+}
+
+/* AES-256 ECB single-block encrypt: pt[16] -> ct[16]. */
+static void aes256_ecb_encrypt(const uint8_t key[32], const uint8_t pt[16], uint8_t ct[16]) {
+    uint32_t rk[60];
+    _aes256_expand(key, rk);
+    uint8_t s[16];
+    for (int i = 0; i < 16; i++) s[i] = pt[i];
+
+    _add_rk(s, &rk[0]);
+    for (int r = 1; r < 14; r++) {
+        _sub_bytes(s);
+        _shift_rows(s);
+        _mix_cols(s);
+        _add_rk(s, &rk[4*r]);
+    }
+    _sub_bytes(s);
+    _shift_rows(s);
+    _add_rk(s, &rk[56]);
+    for (int i = 0; i < 16; i++) ct[i] = s[i];
+}
+
 /* AES-256 ECB single-block decrypt: ct[16] → pt[16] */
 static void aes256_ecb_decrypt(const uint8_t key[32], const uint8_t ct[16], uint8_t pt[16]) {
     uint32_t rk[60];

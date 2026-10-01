@@ -54,12 +54,21 @@ public final class DFBridge {
                                                     byte[] aesCbcKey, byte[] hmacKey, int icvLen,
                                                     int senderPort);
 
+    private static native int nativeProbeScratchFile(IReporter reporter, int encapPort, int spi,
+                                                      byte[] aesCbcKey, byte[] hmacKey, int icvLen,
+                                                      int senderPort, String path, byte[] replacement);
+
     /** One full privileged-free root run. Returns the engine rc (0 = rooted). */
     public static int run(Context context, boolean next, boolean softReboot, IReporter reporter) {
         IpSecManager.UdpEncapsulationSocket encapSock = null;
         IpSecManager.SecurityParameterIndex spiObj = null;
         IpSecTransform transform = null;
         try {
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY &&
+                    !"A059".equals(Build.MODEL)) {
+                reporter.report("[diag] diagnostic-only build supports A059 only\n");
+                return 3;
+            }
             IpSecManager ipsec = (IpSecManager) context.getSystemService(Context.IPSEC_SERVICE);
 
             encapSock = ipsec.openUdpEncapsulationSocket();
@@ -91,11 +100,20 @@ public final class DFBridge {
             // On A059 the native engine currently reports that crash_dump64
             // was patched, but the device then runs the original Android binary.
             // Verify the page-cache bytes before touching the vendor target.
-            if ("A059".equals(Build.MODEL)) {
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY &&
+                    "A059".equals(Build.MODEL)) {
                 try {
                     loadDiagnostic();
                 } catch (Throwable t) {
                     reporter.report("[diag] could not load A059 page-cache probe: " + t + "\n");
+                    return 3;
+                }
+                int scratch = runScratchProbe(context, reporter, encapPort, spiVal,
+                        aesKey, hmacKey, 128 / 8, senderPort);
+                reporter.report("[diag] app-owned scratch page-cache probe rc=" + scratch + "\n");
+                if (scratch != 0) {
+                    reporter.report("[diag] stopping: XFRM page-cache writes are not verified even " +
+                            "on an app-owned read-only file\n");
                     return 3;
                 }
                 final int probe;
@@ -113,6 +131,11 @@ public final class DFBridge {
                 }
             }
 
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY) {
+                reporter.report("[diag] preflight complete; root chain intentionally skipped\n");
+                return com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE;
+            }
+
             stageKsud(context, next, reporter);
 
             // The Next ksud CLI rejects --soft-reboot: never pass it there.
@@ -126,6 +149,35 @@ public final class DFBridge {
             closeQuietly(transform);
             closeQuietly(spiObj);
             closeQuietly(encapSock);
+        }
+    }
+
+    private static int runScratchProbe(Context context, IReporter reporter, int encapPort, int spi,
+                                       byte[] aesKey, byte[] hmacKey, int icvLen, int senderPort) {
+        File probe = new File(context.getCacheDir(), "uniroot-dirtyfrag-pagecache-probe.bin");
+        try {
+            if (probe.exists()) {
+                probe.setWritable(true, false);
+                if (!probe.delete()) throw new IOException("cannot remove stale scratch probe");
+            }
+            byte[] original = new byte[64];
+            byte[] replacement = new byte[64];
+            for (int i = 0; i < original.length; i++) {
+                original[i] = (byte)(0x30 + i);
+                replacement[i] = (byte)(original[i] ^ 0x5a);
+            }
+            try (OutputStream out = new FileOutputStream(probe)) { out.write(original); }
+            if (!probe.setReadOnly()) throw new IOException("cannot mark scratch probe read-only");
+            return nativeProbeScratchFile(reporter, encapPort, spi, aesKey, hmacKey,
+                    icvLen, senderPort, probe.getAbsolutePath(), replacement);
+        } catch (Throwable t) {
+            reporter.report("[diag] scratch page-cache probe setup failed: " + t + "\n");
+            return -1;
+        } finally {
+            if (probe.exists()) {
+                probe.setWritable(true, false);
+                if (!probe.delete()) reporter.report("[diag] could not delete scratch probe file\n");
+            }
         }
     }
 

