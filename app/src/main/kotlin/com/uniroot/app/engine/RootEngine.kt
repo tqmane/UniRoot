@@ -752,18 +752,205 @@ class RootEngine(private val context: Context) {
         return moduleLinePresent(modules)
     }
 
-    private suspend fun runStandaloneShizuku(profile: DeviceProfile): String =
-        StandaloneRootRunner(
-            context = context,
-            appendLog = ::appendLog,
-            runShizukuCommand = { command -> runDiagnosticCommand(command, useShizuku = true) },
-            captureShizukuOutput = { command ->
-                executeCommandAndReturnOutput(command, useShizuku = true)
-            },
-            startShizukuProcess = { command -> newShellProcess(command, useShizuku = true) },
-            kernelSuVisible = ::kernelSuVisibleThroughShizuku,
-            rootAlive = ::rootAlive,
-        ).run(profile)
+    private data class StandaloneProcessResult(
+        val exitCode: Int,
+        val output: String,
+        val timedOut: Boolean,
+    )
+
+    private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
+
+    private fun standaloneExploitSucceeded(log: String): Boolean =
+        log.contains("done=1 root=1") && log.contains("exploit completed attempt=")
+
+    private suspend fun standaloneKsudForTarget(): File {
+        com.uniroot.app.newmethod.DfKsudUpdater.currentTargetClassicKsud(context)?.let { return it }
+        val targetKey = com.uniroot.app.newmethod.DfKsudUpdater.currentTargetKey(classic = true)
+            ?: error("No UniRoot classic KernelSU target is configured for ${Build.MODEL}")
+        appendLog("[KernelSU] Preparing UniRoot classic ksud for $targetKey…")
+        val result = withContext(Dispatchers.IO) {
+            com.uniroot.app.newmethod.DfKsudUpdater.run(
+                context = context,
+                classic = true,
+                onLog = { appendLog("[KernelSU] $it") },
+            )
+        }
+        appendLog("[KernelSU] $result")
+        require(result.startsWith("OK:")) { "Unable to prepare UniRoot ksud: $result" }
+        return com.uniroot.app.newmethod.DfKsudUpdater.currentTargetClassicKsud(context)
+            ?: error("UniRoot updater did not produce a target-matched ksud for $targetKey")
+    }
+
+    /** Standalone PIE payload variant, sharing RootEngine's Shizuku and logging path. */
+    private suspend fun runStandaloneShizuku(profile: DeviceProfile): String {
+        require(profile.deviceType == "nothing" || profile.deviceType == "oneplus") {
+            "Unsupported standalone target type: ${profile.deviceType}"
+        }
+        val payload = File(profile.pathSo)
+        val targetHelper = File(profile.pathCveRoot ?: error("Temporary-root helper path is missing"))
+        val uniRootHelper = File(context.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        require(payload.isFile && targetHelper.isFile && uniRootHelper.isFile) {
+            "Standalone payload, temporary-root helper, or UniRoot helper is missing"
+        }
+        if (kernelSuVisibleThroughShizuku()) {
+            appendLog("[+] KernelSU is already present; skipping another exploit run.")
+            return "Success"
+        }
+
+        // Only the temporary-root handoff uses the imported target helper.
+        // KernelSU itself uses the updater, UniRoot helper, and normal Manager.
+        val ksud = standaloneKsudForTarget()
+        val (payloadRemote, targetHelperRemote, exploitLog) = if (profile.deviceType == "nothing") {
+            Triple(
+                "/data/local/tmp/root-my-nothing-cve43499",
+                "/data/local/tmp/cve-2026-43499-root",
+                "/data/local/tmp/root-my-nothing-exploit.log",
+            )
+        } else {
+            Triple(
+                "/data/local/tmp/root-my-oneplus-pad3-cve43499",
+                "/data/local/tmp/cve-2026-43499-root",
+                "/data/local/tmp/root-my-oneplus-pad3-exploit.log",
+            )
+        }
+
+        val identity = executeCommandAndReturnOutput("id; echo rc=\$?", useShizuku = true)
+        require(identity.contains("uid=2000(shell)")) {
+            "Shizuku is not running as shell: ${identity.trim()}"
+        }
+        val stage = listOf(
+            "cp ${shellQuote(payload.absolutePath)} ${shellQuote(payloadRemote)}",
+            "cp ${shellQuote(targetHelper.absolutePath)} ${shellQuote(targetHelperRemote)}",
+            "chmod 755 ${shellQuote(payloadRemote)} ${shellQuote(targetHelperRemote)}",
+        ).joinToString(" && ")
+        require(runDiagnosticCommand(stage, useShizuku = true) == 0) {
+            "Unable to stage standalone artifacts through Shizuku"
+        }
+
+        val command = if (profile.deviceType == "nothing") {
+            "/system/bin/mkdir -p /data/local/tmp/asteroids; " +
+                "(i=0; while [ \$i -lt 400 ]; do i=\$((i + 1)); " +
+                "/system/bin/head -c 200000 /dev/urandom > /data/local/tmp/asteroids/.kick\$i 2>/dev/null; " +
+                "/system/bin/sync; /system/bin/rm -f /data/local/tmp/asteroids/.kick\$i; done) & " +
+                "kicker=\$!; EXPLOIT_ATTEMPTS=24 EXPLOIT_ATTEMPT_TIMEOUT_SEC=300 " +
+                "$payloadRemote > $exploitLog 2>&1; rc=\$?; " +
+                "kill \$kicker 2>/dev/null; wait \$kicker 2>/dev/null; " +
+                "/system/bin/rm -f /data/local/tmp/asteroids/.kick*; exit \$rc"
+        } else {
+            "exec $payloadRemote > $exploitLog 2>&1"
+        }
+        if (!runStandalonePayload(command, exploitLog)) {
+            appendLog("[Error] Standalone exploit did not report its root-install success markers.")
+            return "Failed"
+        }
+
+        appendLog("[Success] Temporary root acquired; staging UniRoot KernelSU…")
+        val uniRootHelperRemote = "/data/local/tmp/uniroot-cve43499-root"
+        val ksudRemote = "/data/local/tmp/ksud"
+        val lateStage = listOf(
+            "cp ${shellQuote(uniRootHelper.absolutePath)} ${shellQuote(uniRootHelperRemote)}",
+            "cp ${shellQuote(ksud.absolutePath)} ${shellQuote(ksudRemote)}",
+            "cp ${shellQuote(ksud.absolutePath)} /data/local/tmp/ksud-s25u-kdp",
+            "cp ${shellQuote(ksud.absolutePath)} /data/local/tmp/.ksud-stage",
+            "chmod 755 ${shellQuote(uniRootHelperRemote)} ${shellQuote(ksudRemote)} /data/local/tmp/ksud-s25u-kdp /data/local/tmp/.ksud-stage",
+        ).joinToString(" && ")
+        require(runDiagnosticCommand(lateStage, useShizuku = true) == 0) {
+            "Unable to stage UniRoot KernelSU artifacts"
+        }
+
+        val lateLoad = newShellProcess("exec ${shellQuote(uniRootHelperRemote)} --late-load", true)
+        val result = captureStandaloneProcess(lateLoad, timeoutMillis = 180_000L)
+        if (result.output.isNotBlank()) appendLog("[LATE] ${result.output}")
+        var moduleLive = false
+        for (attempt in 0 until 15) {
+            if (kernelSuVisibleThroughShizuku()) {
+                moduleLive = true
+                break
+            }
+            delay(500)
+        }
+        require(moduleLive) {
+            when {
+                result.timedOut -> "KernelSU late-load timed out and no live module was detected"
+                result.exitCode != 0 -> "KernelSU late-load failed (rc=${result.exitCode}) and no live module was detected"
+                else -> "KernelSU late-load exited successfully, but no live module was detected"
+            }
+        }
+        if (result.exitCode != 0) {
+            appendLog("[!] Late-load process ended with rc=${result.exitCode}; live KernelSU module verified.")
+        }
+        if (!rootAlive()) {
+            appendLog("[!] KernelSU is loaded, but UniRoot has no confirmed uid=0 grant yet.")
+            appendLog("[!] Open the UniRoot-selected KernelSU Manager and authorize UniRoot.")
+        }
+        appendLog("[Pipeline] KernelSU module is live.")
+        return "Success"
+    }
+
+    private suspend fun runStandalonePayload(command: String, logPath: String): Boolean {
+        check(runDiagnosticCommand("rm -f ${shellQuote(logPath)}", useShizuku = true) == 0) {
+            "Unable to clear the previous exploit log"
+        }
+        val process = newShellProcess(command, useShizuku = true)
+        val startedAt = System.currentTimeMillis()
+        var previousLog = ""
+        var exitCode = -1
+        var timedOut = false
+        while (System.currentTimeMillis() - startedAt < 15 * 60_000L) {
+            val log = executeCommandAndReturnOutput("cat ${shellQuote(logPath)} 2>/dev/null", true)
+            if (log.length > previousLog.length) {
+                appendLog(log.substring(previousLog.length).trim())
+                previousLog = log
+            }
+            val alive = withContext(Dispatchers.IO) {
+                runCatching { process.isAlive }.getOrDefault(false)
+            }
+            if (!alive) {
+                exitCode = withContext(Dispatchers.IO) {
+                    runCatching { process.exitValue() }.getOrDefault(-1)
+                }
+                break
+            }
+            delay(250)
+        }
+        if (exitCode == -1 && withContext(Dispatchers.IO) {
+                runCatching { process.isAlive }.getOrDefault(false)
+            }) {
+            timedOut = true
+            process.destroyForcibly()
+        }
+        val finalLog = executeCommandAndReturnOutput("cat ${shellQuote(logPath)} 2>/dev/null", true)
+        if (finalLog.length > previousLog.length) {
+            appendLog(finalLog.substring(previousLog.length).trim())
+        }
+        if (finalLog.isBlank()) appendLog("[!] Exploit log is empty — payload did not produce output.")
+        if (timedOut) appendLog("[!] Standalone payload timed out after 15 minutes.")
+        if (exitCode != 0) appendLog("[Exploit] Shizuku process exit code: $exitCode")
+        return !timedOut && standaloneExploitSucceeded(finalLog)
+    }
+
+    private suspend fun captureStandaloneProcess(
+        process: Process,
+        timeoutMillis: Long,
+    ): StandaloneProcessResult = withContext(Dispatchers.IO) {
+        val stdout = StringBuilder()
+        val stderr = StringBuilder()
+        fun drain(input: java.io.InputStream, output: StringBuilder, name: String) = Thread({
+            val text = runCatching { input.bufferedReader().use { it.readText() } }.getOrDefault("")
+            synchronized(output) { output.append(text) }
+        }, name).apply { isDaemon = true; start() }
+        val outThread = drain(process.inputStream, stdout, "uniroot-standalone-stdout")
+        val errThread = drain(process.errorStream, stderr, "uniroot-standalone-stderr")
+        val finished = runCatching {
+            process.waitFor(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (!finished) runCatching { process.destroyForcibly() }
+        runCatching { outThread.join(2_000) }
+        runCatching { errThread.join(2_000) }
+        val output = synchronized(stdout) { stdout.toString() } + synchronized(stderr) { stderr.toString() }
+        val exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(-1) else -2
+        StandaloneProcessResult(exitCode, output.trim(), timedOut = !finished)
+    }
 
 
     suspend fun runExecutionPipeline(rawProfile: DeviceProfile, useShizukuParam: Boolean): String {
