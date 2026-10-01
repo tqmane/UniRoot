@@ -7,6 +7,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
+import android.system.Os
 import java.io.File
 
 /**
@@ -47,7 +48,8 @@ object DeviceInfoPanel {
     /** Kernel KMI parsed from the release string (e.g. android15-6.6). */
     fun kmi(): String? = Regex("android(1[0-9])-([0-9]+\\.[0-9]+)").find(kernelRelease())?.value
 
-    fun kernelRelease(): String = System.getProperty("os.version") ?: Build.VERSION.INCREMENTAL ?: "?"
+    fun kernelRelease(): String = runCatching { Os.uname().release }
+        .getOrElse { System.getProperty("os.version") ?: Build.VERSION.INCREMENTAL ?: "?" }
 
     fun is64Bit(): Boolean = Build.SUPPORTED_64_BIT_ABIS.isNotEmpty()
 

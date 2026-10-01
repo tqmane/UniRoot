@@ -3,6 +3,7 @@ package com.uniroot.app.engine
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
+import android.system.Os
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -666,8 +667,14 @@ class RootEngine(private val context: Context) {
     fun detectDevice(): DeviceInfo {
         val model = Build.MODEL ?: ""
         val incremental = Build.VERSION.INCREMENTAL ?: ""
-        val kernel = runCatching { File("/proc/version").readText() }.getOrDefault("")
-            .substringAfter("Linux version ", "").substringBefore(" (").trim()
+        val kernel = runCatching { Os.uname().release }.getOrElse {
+            runCatching {
+                File("/proc/version").readText()
+                    .substringAfter("Linux version ", "")
+                    .substringBefore(" (")
+                    .trim()
+            }.getOrDefault("")
+        }
         val matched: String? = when {
             (model.startsWith("SM-F971") || model.startsWith("SM-F976")) && kernel.contains("6.12.58") -> "F976X 6.12.58"
             model.startsWith("SM-S948") && kernel.contains("6.12.69") -> "S26 Ultra 6.12.69 ZZHK"
