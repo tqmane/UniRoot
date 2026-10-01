@@ -9,6 +9,7 @@ val appName = "Uni-Root"
 val appVersionName = "5.0.0"
 
 android {
+    ndkVersion = "30.0.16248370"
     namespace = "com.uniroot.app"
     compileSdk {
         version = release(37) {
@@ -21,6 +22,9 @@ android {
         targetSdk = 37
         versionCode = 300
         versionName = appVersionName
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
     buildTypes {
         release {
@@ -36,6 +40,12 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/jni/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }

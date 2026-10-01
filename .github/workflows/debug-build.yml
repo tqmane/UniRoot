@@ -40,7 +40,9 @@ jobs:
           sdkmanager --install \
             "platforms;android-37.2" \
             "build-tools;37.0.0" \
-            "platform-tools"
+            "platform-tools" \
+            "cmake;3.22.1" \
+            "ndk;30.0.16248370"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

