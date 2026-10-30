@@ -147,6 +147,7 @@ data class UniUiState(
     val newMethod: Boolean = false,
     val newMethodBootEnabled: Boolean = false,
     val newMethodAutoSoftReboot: Boolean = true,
+    val newMethodAutoZygiskAvailable: Boolean = false,
     val newMethodProgress: Int = 0,
     val newMethodStage: String = "",
     // New méthode + KernelSU Next : profil ksud embarqué choisi (3.3.0, 3.4.0…).
@@ -1047,8 +1048,12 @@ private fun ControlPanel(
                     SwitchPreference(
                         checked = state.newMethodAutoSoftReboot,
                         onCheckedChange = actions::onNewMethodSoftRebootChanged,
-                        title = stringResource(R.string.new_method_soft_reboot_title),
-                        summary = stringResource(R.string.new_method_soft_reboot_summary),
+                        title = stringResource(
+                            if (state.newMethodAutoZygiskAvailable) R.string.new_method_zygisk_title
+                            else R.string.new_method_soft_reboot_title),
+                        summary = stringResource(
+                            if (state.newMethodAutoZygiskAvailable) R.string.new_method_zygisk_summary
+                            else R.string.new_method_soft_reboot_summary),
                     )
                 }
             }

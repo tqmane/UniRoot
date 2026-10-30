@@ -36,7 +36,9 @@
     <string name="new_method_boot_summary">Re-roots the phone automatically at every boot (before first unlock)</string>
     <string name="new_method_soft_reboot_title">Auto soft reboot</string>
     <string name="new_method_soft_reboot_summary">Soft reboots after boot re-rooting so the manager refreshes (KernelSU classic only)</string>
-    <string name="new_method_advanced_info">New method settings (Start on boot, Auto soft reboot) are on the home screen — right under the method switch. Nothing else to configure: no profile, no setup.</string>
+    <string name="new_method_zygisk_title">Auto-start NeoZygisk</string>
+    <string name="new_method_zygisk_summary">After New Root now, starts enabled NeoZygisk. Manually soft-reboot afterward to activate Zygisk/Vector (OnePlus Pad 3, KernelSU classic)</string>
+    <string name="new_method_advanced_info">New method settings are on the home screen — right under the method switch. Nothing else to configure: no profile, no setup.</string>
     <string name="new_method_about">New method = DirtyFrag engine (dfroot): root from the app alone, at every boot when enabled. Completely independent from the old method, profiles and instant root.</string>
     <string name="new_method_rooted_no_grant">Phone is rooted — allow UniRoot in KernelSU (Next) to confirm it in-app</string>
     <string name="new_method_failed">New method failed — see the log (a retry or a reboot helps)</string>
