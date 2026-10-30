@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object DfEngine {
 
     const val KSUD_PREPARATION_FAILED = -2
+    const val DIAGNOSTIC_ONLY_COMPLETE = 4
 
     @Volatile private var stage: String = "Chargement moteur DF…"
     @Volatile private var milestone: Int = 12
@@ -38,7 +39,8 @@ object DfEngine {
         milestone = 12
         onProgress(milestone, stage)
 
-        if (!DfKsudUpdater.ensureTargetKsud(context, next = ksuNext, onLog = onLog)) {
+        if (!com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY &&
+            !DfKsudUpdater.ensureTargetKsud(context, next = ksuNext, onLog = onLog)) {
             stage = "Target KernelSU module unavailable"
             onProgress(100, stage)
             return KSUD_PREPARATION_FAILED
@@ -85,7 +87,11 @@ object DfEngine {
             done.set(true)
             ticker.join(1500)
         }
-        onProgress(100, if (rc == 0) "Phone rooted ✓" else "Failed (engine rc=$rc) - see log")
+        onProgress(100, when (rc) {
+            0 -> "Phone rooted ✓"
+            DIAGNOSTIC_ONLY_COMPLETE -> "Diagnostic complete — root chain skipped"
+            else -> "Failed (engine rc=$rc) - see log"
+        })
         return rc
     }
 }

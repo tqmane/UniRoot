@@ -116,9 +116,21 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                     this, com.uniroot.app.newmethod.NewMethodBootReceiver::class.java)
             ) == android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
         }.getOrDefault(false)
-        newMethodSoftReboot = createDeviceProtectedStorageContext()
+        val newMethodDevicePrefs = createDeviceProtectedStorageContext()
             .getSharedPreferences(com.uniroot.app.newmethod.NewMethodBootReceiver.PREFS, MODE_PRIVATE)
-            .getBoolean(com.uniroot.app.newmethod.NewMethodBootReceiver.PREF_AUTO_SOFT_REBOOT, true)
+        val zygiskAutoStartMigrated = newMethodDevicePrefs.getBoolean("zygisk_auto_start_migrated_v1", false)
+        if ("OPD2415" == android.os.Build.MODEL && !ksuNextMode && !zygiskAutoStartMigrated) {
+            // Enable OnePlus NeoZygisk startup once for existing installs; a
+            // later user opt-out is preserved by the migration marker.
+            newMethodSoftReboot = true
+            newMethodDevicePrefs.edit()
+                .putBoolean(com.uniroot.app.newmethod.NewMethodBootReceiver.PREF_AUTO_SOFT_REBOOT, true)
+                .putBoolean("zygisk_auto_start_migrated_v1", true)
+                .apply()
+        } else {
+            newMethodSoftReboot = newMethodDevicePrefs.getBoolean(
+                com.uniroot.app.newmethod.NewMethodBootReceiver.PREF_AUTO_SOFT_REBOOT, true)
+        }
         runLogs = engine.listRunLogs()
         refreshInstantRootState()
         refreshDevice()
@@ -171,6 +183,7 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                     newMethod = newMethod,
                     newMethodBootEnabled = newMethodBootEnabled,
                     newMethodAutoSoftReboot = newMethodSoftReboot,
+                    newMethodAutoZygiskAvailable = "OPD2415" == android.os.Build.MODEL && !ksuNextMode,
                     newMethodProgress = newMethodProgress,
                     newMethodStage = newMethodStage,
                     ksudNextProfiles = ksudNextProfiles,
@@ -470,6 +483,12 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
             // the manager-style essentials only.
             val keep = setOf("Device", "Android", "Kernel")
             deviceInfoRows = rows.filter { it.first in keep }
+            if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY) {
+                rootStateRow = "Diagnostic"
+                rootDetailRow = "Root probes disabled in diagnostic build"
+                selinuxRow = ""
+                return@launch
+            }
             // Grant-independent root state + flavor line
             val (state, _, detail) = com.uniroot.app.engine.DeviceInfoPanel.rootState()
             val flavor = com.uniroot.app.engine.DeviceInfoPanel.flavor(this@MainActivity)
@@ -612,12 +631,26 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                         })
                 }
                 engine.appendLog("[NewMethod] DF rc=$rc")
-                if (rc == 0) {
+                if (rc == com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE) {
+                    newMethodProgress = 100
+                    newMethodStage = "Diagnostic complete — root chain skipped"
+                    Toast.makeText(this@MainActivity,
+                        "Page-cache diagnostic complete; root chain was not run",
+                        Toast.LENGTH_LONG).show()
+                } else if (rc == 0) {
                     newMethodProgress = 100
                     newMethodStage = "Phone rooted ✓"
                     engine.markRooted("DF")
                     Toast.makeText(this@MainActivity, R.string.phone_rooted_toast, Toast.LENGTH_LONG).show()
-                    if (newMethodSoftReboot) {
+                    if ("OPD2415" == android.os.Build.MODEL && !ksuNextMode) {
+                        engine.appendLog(if (newMethodSoftReboot) {
+                            "[NewMethod] Root-time wrapper queued NeoZygisk startup. Manually soft-reboot to " +
+                                "activate Zygisk/Vector; runtime log: /data/local/tmp/uniroot-ksud-late-load.log"
+                        } else {
+                            "[NewMethod] NeoZygisk auto-start is off; no framework reboot will be issued."
+                        })
+                        delay(4_000)
+                    } else if (newMethodSoftReboot) {
                         engine.appendLog("[NewMethod] auto soft reboot…")
                         delay(2_500)
                         runCatching {
@@ -635,7 +668,9 @@ class MainActivity : ComponentActivity(), Shizuku.OnRequestPermissionResultListe
                 engine.setRunning(false)
                 sheetDismissible = true
                 runCatching {
-                    engine.endRunLog(if (rc == 0) "Success" else "Failed", "GhostSam",
+                    engine.endRunLog(
+                        if (rc == 0) "Success" else if (rc == com.uniroot.app.newmethod.DfEngine.DIAGNOSTIC_ONLY_COMPLETE) "Diagnostic" else "Failed",
+                        "GhostSam",
                         android.os.SystemClock.elapsedRealtime() - t0)
                 }
                 runLogs = engine.listRunLogs()

@@ -179,7 +179,11 @@ class RootEngine(private val context: Context) {
         refreshBundledBinaries()
         loadProfiles()
         ensureDefaultProfiles()
-        restoreRootedState()
+        if (com.uniroot.app.BuildConfig.DIRTYFRAG_DIAGNOSTIC_ONLY) {
+            _rooted.value = false
+        } else {
+            restoreRootedState()
+        }
         recoverInterruptedRuns()
         lastCrash()?.let { appendLog("[!] Previous run CRASHED (app):"); it.lineSequence().take(12).forEach { appendLog("    $it") } }
     }
